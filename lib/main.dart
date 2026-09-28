@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'board_note.dart';
+
 void main() {
   runApp(const ConnectionsBoardApp());
 }
@@ -34,6 +36,13 @@ class ConnectionsBoardScreen extends StatefulWidget {
 class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
   // Default background color for the board canvas
   Color _boardColor = const Color(0xFF1E1E2C);
+
+  // In-memory floating notes (no persistence yet).
+  final List<BoardNote> _notes = [];
+  int _nextNoteId = 0;
+
+  static const double noteWidth = 160;
+  static const double noteHeight = 120;
 
   // Preset colors for quick selection in the color picker
   static const List<Color> _presetColors = [
@@ -72,6 +81,44 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
     );
   }
 
+  void _addNote() {
+    final Size size = MediaQuery.of(context).size;
+    final double dx = (size.width - noteWidth) / 2;
+    final double dy = (size.height - noteHeight) / 2;
+    setState(() {
+      _notes.add(
+        BoardNote(
+          id: _nextNoteId++,
+          position: Offset(dx.clamp(0.0, double.infinity), dy.clamp(0.0, double.infinity)),
+        ),
+      );
+    });
+  }
+
+  void _bringToFront(int id) {
+    final int index = _notes.indexWhere((n) => n.id == id);
+    // Root cause fix for drag cancellation: skip rebuild when already front.
+    // Reordering during onPanStart disposes the active pan recognizer.
+    if (index == -1 || index == _notes.length - 1) return;
+    setState(() {
+      final BoardNote note = _notes.removeAt(index);
+      _notes.add(note);
+    });
+  }
+
+  void _moveNote(int id, Offset delta, Size viewport) {
+    setState(() {
+      final int index = _notes.indexWhere((n) => n.id == id);
+      if (index == -1) return;
+      final BoardNote note = _notes[index];
+      final double maxX = (viewport.width - noteWidth).clamp(0.0, double.infinity);
+      final double maxY = (viewport.height - noteHeight).clamp(0.0, double.infinity);
+      final double nx = (note.position.dx + delta.dx).clamp(0.0, maxX);
+      final double ny = (note.position.dy + delta.dy).clamp(0.0, maxY);
+      note.position = Offset(nx, ny);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     // Calculate contrast color for the top-right button icon border/shadow
@@ -81,6 +128,7 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
     final Color buttonBgColor = isDark
         ? Colors.black.withOpacity(0.4)
         : Colors.white.withOpacity(0.8);
+    final Size viewport = MediaQuery.of(context).size;
 
     return Scaffold(
       body: Stack(
@@ -93,6 +141,19 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
             height: double.infinity,
             color: _boardColor,
           ),
+
+          // Floating notes (painted in list order, last on top).
+          for (final BoardNote note in _notes)
+            Positioned(
+              left: note.position.dx,
+              top: note.position.dy,
+              child: _NoteCard(
+                key: ValueKey('note_card_${note.id}'),
+                note: note,
+                onDragStart: () => _bringToFront(note.id),
+                onDragUpdate: (delta) => _moveNote(note.id, delta, viewport),
+              ),
+            ),
 
           // Small color-picker button fixed in the top-right corner
           SafeArea(
@@ -159,7 +220,150 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
             ),
           ),
           ),
+          // Add-note button fixed in the bottom-right corner.
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Align(
+                alignment: Alignment.bottomRight,
+                child: Material(
+                  color: Colors.transparent,
+                  child: Tooltip(
+                    message: 'Add note',
+                    child: InkWell(
+                      onTap: _addNote,
+                      borderRadius: BorderRadius.circular(28),
+                      child: Container(
+                        width: 56,
+                        height: 56,
+                        decoration: BoxDecoration(
+                          color: buttonBgColor,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: buttonFgColor.withOpacity(0.3),
+                            width: 1.5,
+                          ),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 8,
+                              offset: const Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                        child: Icon(
+                          Icons.add,
+                          size: 28,
+                          color: buttonFgColor,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class _NoteCard extends StatefulWidget {
+  final BoardNote note;
+  final VoidCallback onDragStart;
+  final ValueChanged<Offset> onDragUpdate;
+
+  const _NoteCard({
+    super.key,
+    required this.note,
+    required this.onDragStart,
+    required this.onDragUpdate,
+  });
+
+  @override
+  State<_NoteCard> createState() => _NoteCardState();
+}
+
+class _NoteCardState extends State<_NoteCard> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.note.text);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onPanStart: (_) => widget.onDragStart(),
+      onPanUpdate: (details) => widget.onDragUpdate(details.delta),
+      child: Container(
+        width: _ConnectionsBoardScreenState.noteWidth,
+        height: _ConnectionsBoardScreenState.noteHeight,
+        decoration: BoxDecoration(
+          color: widget.note.color,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.black.withOpacity(0.15)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.25),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            // Drag handle: guaranteed pan area outside the TextField so
+            // dragging works even though the editable field claims
+            // gestures in the body. Whole card remains wrapped in the
+            // outer pan GestureDetector, so edge drags work too.
+            Container(
+              key: ValueKey('note_handle_${widget.note.id}'),
+              height: 24,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.08),
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(12),
+                  topRight: Radius.circular(12),
+                ),
+              ),
+              child: const Icon(Icons.drag_handle, size: 16, color: Colors.black54),
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                child: TextField(
+                  controller: _controller,
+                  onChanged: (value) => widget.note.text = value,
+                  maxLines: null,
+                  expands: true,
+                  // Reduce inner gesture competition so outer pan wins
+                  // on background areas while tap-to-edit still works.
+                  scrollPhysics: const NeverScrollableScrollPhysics(),
+                  textAlignVertical: TextAlignVertical.top,
+                  style: const TextStyle(fontSize: 14, color: Colors.black87),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    hintText: 'Note',
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
