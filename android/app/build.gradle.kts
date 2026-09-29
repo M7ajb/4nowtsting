@@ -5,6 +5,14 @@ plugins {
 }
 
 android {
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("boardlesswall-debug.keystore")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "debug123"
+            keyAlias = "boardlesswall"
+            keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: "debug123"
+        }
+    }
     namespace = "com.example.connectionsboard.connections_board"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion

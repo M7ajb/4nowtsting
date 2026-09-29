@@ -119,6 +119,20 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
     });
   }
 
+  Future<void> _openNoteEditor(BoardNote note) async {
+    final String? updated = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => NoteEditorPage(initialText: note.text),
+      ),
+    );
+    if (!mounted) return;
+    if (updated != null && updated != note.text) {
+      setState(() {
+        note.text = updated;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // Calculate contrast color for the top-right button icon border/shadow
@@ -152,6 +166,7 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
                 note: note,
                 onDragStart: () => _bringToFront(note.id),
                 onDragUpdate: (delta) => _moveNote(note.id, delta, viewport),
+                onLongPress: () => _openNoteEditor(note),
               ),
             ),
 
@@ -269,48 +284,32 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
   }
 }
 
-class _NoteCard extends StatefulWidget {
+class _NoteCard extends StatelessWidget {
   final BoardNote note;
   final VoidCallback onDragStart;
   final ValueChanged<Offset> onDragUpdate;
+  final VoidCallback onLongPress;
 
   const _NoteCard({
     super.key,
     required this.note,
     required this.onDragStart,
     required this.onDragUpdate,
+    required this.onLongPress,
   });
 
   @override
-  State<_NoteCard> createState() => _NoteCardState();
-}
-
-class _NoteCardState extends State<_NoteCard> {
-  late final TextEditingController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = TextEditingController(text: widget.note.text);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
+    final bool isEmpty = note.text.isEmpty;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onPanStart: (_) => widget.onDragStart(),
-      onPanUpdate: (details) => widget.onDragUpdate(details.delta),
+      onPanStart: (_) => onDragStart(),
+      onPanUpdate: (details) => onDragUpdate(details.delta),
       child: Container(
         width: _ConnectionsBoardScreenState.noteWidth,
         height: _ConnectionsBoardScreenState.noteHeight,
         decoration: BoxDecoration(
-          color: widget.note.color,
+          color: note.color,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: Colors.black.withOpacity(0.15)),
           boxShadow: [
@@ -323,12 +322,13 @@ class _NoteCardState extends State<_NoteCard> {
         ),
         child: Column(
           children: [
-            // Drag handle: guaranteed pan area outside the TextField so
-            // dragging works even though the editable field claims
-            // gestures in the body. Whole card remains wrapped in the
-            // outer pan GestureDetector, so edge drags work too.
+            // Drag handle: guaranteed pan area so dragging works.
+            // Whole card remains wrapped in the outer pan
+            // GestureDetector, so edge drags work too.
+            // Long-press is isolated to the preview body so handle
+            // drags never compete with the long-press recognizer.
             Container(
-              key: ValueKey('note_handle_${widget.note.id}'),
+              key: ValueKey('note_handle_${note.id}'),
               height: 24,
               alignment: Alignment.center,
               decoration: BoxDecoration(
@@ -341,28 +341,86 @@ class _NoteCardState extends State<_NoteCard> {
               child: const Icon(Icons.drag_handle, size: 16, color: Colors.black54),
             ),
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                child: TextField(
-                  controller: _controller,
-                  onChanged: (value) => widget.note.text = value,
-                  maxLines: null,
-                  expands: true,
-                  // Reduce inner gesture competition so outer pan wins
-                  // on background areas while tap-to-edit still works.
-                  scrollPhysics: const NeverScrollableScrollPhysics(),
-                  textAlignVertical: TextAlignVertical.top,
-                  style: const TextStyle(fontSize: 14, color: Colors.black87),
-                  decoration: const InputDecoration(
-                    border: InputBorder.none,
-                    hintText: 'Note',
-                    isDense: true,
-                    contentPadding: EdgeInsets.zero,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPress: onLongPress,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                  child: Align(
+                    alignment: Alignment.topLeft,
+                    child: Text(
+                      isEmpty ? 'Note' : note.text,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: isEmpty ? Colors.black45 : Colors.black87,
+                      ),
+                    ),
                   ),
                 ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class NoteEditorPage extends StatefulWidget {
+  final String initialText;
+
+  const NoteEditorPage({super.key, required this.initialText});
+
+  @override
+  State<NoteEditorPage> createState() => _NoteEditorPageState();
+}
+
+class _NoteEditorPageState extends State<NoteEditorPage> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialText);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        Navigator.of(context).pop(_controller.text);
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: const BackButton(),
+        ),
+        body: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: TextField(
+            controller: _controller,
+            autofocus: true,
+            maxLines: null,
+            expands: true,
+            keyboardType: TextInputType.multiline,
+            textAlignVertical: TextAlignVertical.top,
+            style: const TextStyle(fontSize: 16, color: Colors.black87),
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              hintText: 'Note',
+              isDense: true,
+              contentPadding: EdgeInsets.zero,
+            ),
+          ),
         ),
       ),
     );

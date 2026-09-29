@@ -27,7 +27,7 @@ void main() {
     expect(find.text('Cancel'), findsOneWidget);
   });
 
-  testWidgets('Tapping add button creates a note card with editable text', (
+  testWidgets('Tapping add button creates a note card with read-only preview', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const ConnectionsBoardApp());
@@ -38,12 +38,20 @@ void main() {
     await tester.pump();
 
     expect(find.byKey(const ValueKey('note_card_0')), findsOneWidget);
+    // Preview is read-only: Text truncated to 3 lines, no inline TextField.
     expect(
       find.descendant(
         of: find.byKey(const ValueKey('note_card_0')),
         matching: find.byType(TextField),
       ),
-      findsOneWidget,
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('note_card_0')),
+        matching: find.byType(Text),
+      ),
+      findsWidgets,
     );
 
     await tester.tap(find.byIcon(Icons.add));
@@ -87,4 +95,51 @@ void main() {
     expect(clamped.dx, lessThanOrEqualTo(screen.width));
     expect(clamped.dy, lessThanOrEqualTo(screen.height));
   });
+
+  testWidgets('Long-pressing a note opens the full-screen editor', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const ConnectionsBoardApp());
+
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('note_card_0')), findsOneWidget);
+    expect(find.byType(NoteEditorPage), findsNothing);
+
+    await tester.longPress(find.byKey(const ValueKey('note_card_0')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(NoteEditorPage), findsOneWidget);
+    expect(find.byType(Scaffold), findsWidgets);
+    expect(find.byType(BackButton), findsOneWidget);
+    expect(find.byType(TextField), findsOneWidget);
+  });
+
+  testWidgets(
+    'Typing multiple lines in editor and going back updates card preview',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(const ConnectionsBoardApp());
+
+      await tester.tap(find.byIcon(Icons.add));
+      await tester.pump();
+
+      await tester.longPress(find.byKey(const ValueKey('note_card_0')));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(NoteEditorPage), findsOneWidget);
+
+      const String typed = 'line1\nline2\nline3\nline4';
+      await tester.enterText(find.byType(TextField), typed);
+      await tester.pump();
+
+      // Leave via AppBar back button; PopScope returns the edited text.
+      await tester.tap(find.byType(BackButton));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(NoteEditorPage), findsNothing);
+      expect(find.byKey(const ValueKey('note_card_0')), findsOneWidget);
+      expect(find.text(typed), findsOneWidget);
+    },
+  );
 }
