@@ -1,9 +1,31 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'board_note.dart';
 
 void main() {
   runApp(const ConnectionsBoardApp());
+}
+
+/// Deletes attachment files for a removed note. Extracted for unit testing
+/// so real file deletion is verified without pumping images in widget tests.
+Future<void> deleteNoteAttachmentFiles(List<String?> paths) async {
+  for (final String? path in paths) {
+    if (path == null || path.isEmpty) continue;
+    try {
+      final File file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
 }
 
 class ConnectionsBoardApp extends StatelessWidget {
@@ -37,9 +59,12 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
   // Default background color for the board canvas
   Color _boardColor = const Color(0xFF1E1E2C);
 
-  // In-memory floating notes (no persistence yet).
+  // In-memory floating notes (persisted to shared_preferences as JSON).
   final List<BoardNote> _notes = [];
   int _nextNoteId = 0;
+  bool _notesLoaded = false;
+
+  static const String _prefsKey = 'connections_board_notes';
 
   static const double noteWidth = 160;
   static const double noteHeight = 120;
@@ -81,6 +106,68 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
     );
   }
 
+  @override
+  void initState() {
+    super.initState();
+    // Show board immediately, populate notes once loaded (no splash).
+    unawaited(_loadNotes());
+  }
+
+  Future<void> _loadNotes() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final String? raw = prefs.getString(_prefsKey);
+      if (raw == null || raw.isEmpty) {
+        if (mounted) setState(() => _notesLoaded = true);
+        return;
+      }
+      final List<dynamic> decoded = jsonDecode(raw) as List<dynamic>;
+      final List<BoardNote> loaded = [];
+      for (final dynamic entry in decoded) {
+        // Root cause: one corrupt entry aborted the whole load via outer
+        // catch. Fix: skip bad entries individually.
+        try {
+          if (entry is Map<String, dynamic>) {
+            loaded.add(BoardNote.fromJson(entry));
+          } else if (entry is Map) {
+            loaded.add(BoardNote.fromJson(Map<String, dynamic>.from(entry)));
+          }
+        } catch (_) {
+          continue;
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _notes
+          ..clear()
+          ..addAll(loaded);
+        int maxId = -1;
+        for (final BoardNote note in _notes) {
+          if (note.id > maxId) maxId = note.id;
+        }
+        _nextNoteId = maxId + 1;
+        _notesLoaded = true;
+      });
+    } catch (_) {
+      // Corrupt/missing storage: keep board empty.
+      if (mounted) setState(() => _notesLoaded = true);
+    }
+  }
+
+  Future<void> _saveNotes() async {
+    // Root cause: encoding after await could snapshot a stale list during
+    // rapid moves. Fix: snapshot synchronously before any await.
+    final String raw = jsonEncode(
+      _notes.map((BoardNote note) => note.toJson()).toList(),
+    );
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefsKey, raw);
+    } catch (_) {
+      // Storage unavailable (e.g. tests): ignore.
+    }
+  }
+
   void _addNote() {
     final Size size = MediaQuery.of(context).size;
     final double dx = (size.width - noteWidth) / 2;
@@ -93,6 +180,7 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
         ),
       );
     });
+    unawaited(_saveNotes());
   }
 
   void _bringToFront(int id) {
@@ -104,6 +192,7 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
       final BoardNote note = _notes.removeAt(index);
       _notes.add(note);
     });
+    unawaited(_saveNotes());
   }
 
   void _moveNote(int id, Offset delta, Size viewport) {
@@ -117,19 +206,70 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
       final double ny = (note.position.dy + delta.dy).clamp(0.0, maxY);
       note.position = Offset(nx, ny);
     });
+    unawaited(_saveNotes());
   }
 
   Future<void> _openNoteEditor(BoardNote note) async {
-    final String? updated = await Navigator.of(context).push<String>(
+    final NoteEditorResult? updated =
+        await Navigator.of(context).push<NoteEditorResult>(
       MaterialPageRoute(
-        builder: (_) => NoteEditorPage(initialText: note.text),
+        builder: (_) => NoteEditorPage(
+          initialText: note.text,
+          noteId: note.id,
+          initialAudioPath: note.audioPath,
+          initialPhotoPath: note.photoPath,
+        ),
       ),
     );
     if (!mounted) return;
-    if (updated != null && updated != note.text) {
+    if (updated == null) return;
+    if (updated.deleted) {
+      await _deleteNote(note.id);
+      return;
+    }
+    if (updated.text != note.text ||
+        updated.audioPath != note.audioPath ||
+        updated.photoPath != note.photoPath) {
       setState(() {
-        note.text = updated;
+        note.text = updated.text;
+        note.audioPath = updated.audioPath;
+        note.photoPath = updated.photoPath;
       });
+      unawaited(_saveNotes());
+    }
+  }
+
+  Future<void> _deleteNote(int id) async {
+    final int index = _notes.indexWhere((n) => n.id == id);
+    if (index == -1) return;
+    final BoardNote removed = _notes[index];
+    setState(() {
+      _notes.removeAt(index);
+    });
+    unawaited(_saveNotes());
+    await deleteNoteAttachmentFiles([removed.audioPath, removed.photoPath]);
+    // Best-effort cleanup of an interrupted recording tmp file.
+    // Derive from the audio sibling dir first so tests without
+    // path_provider still clean up; docs lookup has a timeout so a
+    // missing plugin never hangs delete.
+    final List<String> tmpCandidates = [];
+    if (removed.audioPath != null && removed.audioPath!.isNotEmpty) {
+      try {
+        tmpCandidates.add(
+          '${File(removed.audioPath!).parent.path}/note_${removed.id}_tmp.m4a',
+        );
+      } catch (_) {}
+    }
+    try {
+      final Directory docs = await getApplicationDocumentsDirectory()
+          .timeout(const Duration(seconds: 2));
+      tmpCandidates.add('${docs.path}/note_${removed.id}_tmp.m4a');
+    } catch (_) {}
+    for (final String tmpPath in tmpCandidates.toSet()) {
+      try {
+        final File tmp = File(tmpPath);
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
     }
   }
 
@@ -167,6 +307,19 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
                 onDragStart: () => _bringToFront(note.id),
                 onDragUpdate: (delta) => _moveNote(note.id, delta, viewport),
                 onLongPress: () => _openNoteEditor(note),
+                onTap: () => _bringToFront(note.id),
+              ),
+            ),
+
+          // Empty-state hint instead of a blank board (only after load,
+          // so saved notes don't flash a hint on startup).
+          if (_notes.isEmpty && _notesLoaded)
+            const Center(
+              child: Text(
+                'Tap + to add your first note',
+                key: ValueKey('empty_state_hint'),
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16, color: Colors.white70),
               ),
             ),
 
@@ -289,6 +442,7 @@ class _NoteCard extends StatelessWidget {
   final VoidCallback onDragStart;
   final ValueChanged<Offset> onDragUpdate;
   final VoidCallback onLongPress;
+  final VoidCallback onTap;
 
   const _NoteCard({
     super.key,
@@ -296,11 +450,27 @@ class _NoteCard extends StatelessWidget {
     required this.onDragStart,
     required this.onDragUpdate,
     required this.onLongPress,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final bool isEmpty = note.text.isEmpty;
+    final bool hasText = note.text.trim().isNotEmpty;
+    final bool hasAttachments =
+        note.audioPath != null || note.photoPath != null;
+    final String previewText;
+    final Color previewColor;
+    if (hasText) {
+      previewText = note.text;
+      previewColor = Colors.black87;
+    } else if (hasAttachments) {
+      previewText = 'Note';
+      previewColor = Colors.black45;
+    } else {
+      previewText = 'Tap to write';
+      previewColor = Colors.black45;
+    }
+    final bool hasPhoto = note.photoPath != null;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onPanStart: (_) => onDragStart(),
@@ -338,25 +508,61 @@ class _NoteCard extends StatelessWidget {
                   topRight: Radius.circular(12),
                 ),
               ),
-              child: const Icon(Icons.drag_handle, size: 16, color: Colors.black54),
+              // Handle is drag-only by design: adding a tap recognizer here
+              // competes in the gesture arena and eats ~20px of drag slop
+              // (regressed the drag test). Tap-to-front lives on the preview
+              // body below, which is the larger target.
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.drag_handle,
+                      size: 16, color: Colors.black54),
+                  if (hasPhoto) ...[
+                    const SizedBox(width: 4),
+                    Icon(
+                      Icons.photo,
+                      key: ValueKey('photo_indicator_${note.id}'),
+                      size: 14,
+                      color: Colors.black54,
+                    ),
+                  ],
+                ],
+              ),
             ),
             Expanded(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
+                onTap: onTap,
                 onLongPress: onLongPress,
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                  child: Align(
-                    alignment: Alignment.topLeft,
-                    child: Text(
-                      isEmpty ? 'Note' : note.text,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: isEmpty ? Colors.black45 : Colors.black87,
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Align(
+                          alignment: Alignment.topLeft,
+                          child: Text(
+                            previewText,
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: previewColor,
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
+                      if (hasPhoto) ...[
+                        const SizedBox(width: 4),
+                        _PhotoThumb(
+                          path: note.photoPath!,
+                          size: 36,
+                          key: ValueKey(
+                              'photo_thumb_card_${note.id}'),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
@@ -368,10 +574,67 @@ class _NoteCard extends StatelessWidget {
   }
 }
 
+class _PhotoThumb extends StatelessWidget {
+  final String path;
+  final double size;
+
+  const _PhotoThumb({super.key, required this.path, required this.size});
+
+  @override
+  Widget build(BuildContext context) {
+    final File file = File(path);
+    if (!file.existsSync()) {
+      return Icon(Icons.photo_outlined,
+          size: size * 0.6, color: Colors.black45);
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.file(
+        file,
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => const Icon(
+          Icons.photo_outlined,
+          size: 20,
+          color: Colors.black45,
+        ),
+      ),
+    );
+  }
+}
+
+typedef PhotoPickerFn = Future<XFile?> Function(ImageSource source);
+
+class NoteEditorResult {
+  final String text;
+  final String? audioPath;
+  final String? photoPath;
+  final bool deleted;
+
+  const NoteEditorResult({
+    required this.text,
+    this.audioPath,
+    this.photoPath,
+    this.deleted = false,
+  });
+}
+
 class NoteEditorPage extends StatefulWidget {
   final String initialText;
+  final int noteId;
+  final String? initialAudioPath;
+  final String? initialPhotoPath;
+  final PhotoPickerFn? photoPicker;
 
-  const NoteEditorPage({super.key, required this.initialText});
+  const NoteEditorPage({
+    super.key,
+    required this.initialText,
+    required this.noteId,
+    this.initialAudioPath,
+    this.initialPhotoPath,
+    this.photoPicker,
+  });
 
   @override
   State<NoteEditorPage> createState() => _NoteEditorPageState();
@@ -379,17 +642,290 @@ class NoteEditorPage extends StatefulWidget {
 
 class _NoteEditorPageState extends State<NoteEditorPage> {
   late final TextEditingController _controller;
+  late final AudioPlayer _player;
+  AudioRecorder? _recorder;
+  StreamSubscription<void>? _completeSub;
+
+  String? _audioPath;
+  String? _photoPath;
+  bool _isRecording = false;
+  bool _isPlaying = false;
+  bool _isPickingPhoto = false;
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.initialText);
+    _audioPath = widget.initialAudioPath;
+    _photoPath = widget.initialPhotoPath;
+    _player = AudioPlayer();
+    _completeSub = _player.onPlayerComplete.listen((_) {
+      if (mounted) setState(() => _isPlaying = false);
+    });
+    unawaited(_validateInitialPhoto());
+  }
+
+  Future<void> _validateInitialPhoto() async {
+    final String? path = _photoPath;
+    if (path == null) return;
+    final bool exists = await File(path).exists();
+    if (!exists && mounted) setState(() => _photoPath = null);
   }
 
   @override
   void dispose() {
+    _completeSub?.cancel();
+    if (_isRecording) {
+      _recorder?.cancel();
+    }
+    _recorder?.dispose();
+    _player.dispose();
     _controller.dispose();
     super.dispose();
+  }
+
+  void _popWithResult() {
+    Navigator.of(context).pop(
+      NoteEditorResult(
+        text: _controller.text,
+        audioPath: _audioPath,
+        photoPath: _photoPath,
+      ),
+    );
+  }
+
+  Future<void> _toggleRecord() async {
+    if (_isRecording) {
+      await _stopRecording();
+      return;
+    }
+    if (_isPlaying) {
+      await _player.stop();
+      if (mounted) setState(() => _isPlaying = false);
+    }
+    PermissionStatus status = await Permission.microphone.status;
+    if (!status.isGranted) {
+      status = await Permission.microphone.request();
+    }
+    if (!status.isGranted) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Microphone permission denied')),
+      );
+      return;
+    }
+    try {
+      final Directory docs = await getApplicationDocumentsDirectory();
+      final String tmpPath = '${docs.path}/note_${widget.noteId}_tmp.m4a';
+      _recorder ??= AudioRecorder();
+      await _recorder!.start(const RecordConfig(), path: tmpPath);
+      if (mounted) setState(() => _isRecording = true);
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not start recording')),
+      );
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    try {
+      final String? stoppedPath = await _recorder?.stop();
+      final Directory docs = await getApplicationDocumentsDirectory();
+      final String finalPath = '${docs.path}/note_${widget.noteId}.m4a';
+      String resolved = finalPath;
+      if (stoppedPath != null && stoppedPath != finalPath) {
+        // Promote tmp recording so abort (cancel) never deletes old clip.
+        final File tmpFile = File(stoppedPath);
+        if (await tmpFile.exists()) {
+          if (await File(finalPath).exists()) {
+            await File(finalPath).delete();
+          }
+          await tmpFile.rename(finalPath);
+        } else {
+          resolved = stoppedPath;
+        }
+      }
+      if (mounted) {
+        setState(() {
+          _isRecording = false;
+          _audioPath = resolved;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isRecording = false);
+    }
+  }
+
+  Future<void> _togglePlayback() async {
+    final String? path = _audioPath;
+    if (path == null) return;
+    try {
+      if (_isPlaying) {
+        await _player.pause();
+        if (mounted) setState(() => _isPlaying = false);
+      } else {
+        if (!await File(path).exists()) {
+          if (mounted) {
+            setState(() {
+              _audioPath = null;
+              _isPlaying = false;
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Audio file not found')),
+            );
+          }
+          return;
+        }
+        if (_player.state == PlayerState.paused) {
+          await _player.resume();
+        } else {
+          await _player.play(DeviceFileSource(path));
+        }
+        if (mounted) setState(() => _isPlaying = true);
+      }
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not play audio')),
+      );
+    }
+  }
+
+  Future<XFile?> _defaultPhotoPicker(ImageSource source) {
+    return ImagePicker().pickImage(
+      source: source,
+      imageQuality: 85,
+      maxWidth: 1600,
+    );
+  }
+
+  void _showPhotoSourceSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                key: const ValueKey('photo_source_camera'),
+                leading: const Icon(Icons.camera_alt),
+                title: const Text('Take photo'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  unawaited(_pickPhoto(ImageSource.camera));
+                },
+              ),
+              ListTile(
+                key: const ValueKey('photo_source_gallery'),
+                leading: const Icon(Icons.photo_library),
+                title: const Text('Choose from gallery'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  unawaited(_pickPhoto(ImageSource.gallery));
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _pickPhoto(ImageSource source) async {
+    if (_isPickingPhoto) return;
+    setState(() => _isPickingPhoto = true);
+    try {
+      final PhotoPickerFn picker = widget.photoPicker ?? _defaultPhotoPicker;
+      final XFile? picked = await picker(source);
+      if (!mounted) return;
+      if (picked == null) return;
+      final Directory docs = await getApplicationDocumentsDirectory();
+      final String dest = '${docs.path}/note_${widget.noteId}.jpg';
+      if (picked.path == dest) {
+        if (mounted) setState(() => _photoPath = dest);
+        return;
+      }
+      final String? old = _photoPath;
+      await File(picked.path).copy(dest);
+      if (old != null && old != dest) {
+        try {
+          final File oldFile = File(old);
+          if (await oldFile.exists()) await oldFile.delete();
+        } catch (_) {}
+      }
+      if (mounted) setState(() => _photoPath = dest);
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not attach photo')),
+      );
+    } finally {
+      if (mounted) setState(() => _isPickingPhoto = false);
+    }
+  }
+
+  Future<void> _removePhoto() async {
+    final String? path = _photoPath;
+    if (path == null) return;
+    try {
+      final File file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+    if (mounted) setState(() => _photoPath = null);
+  }
+
+  Future<void> _confirmDelete() async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Delete note?'),
+          content: const Text(
+            'This removes the note and its audio and photo files.',
+          ),
+          actions: [
+            TextButton(
+              key: const ValueKey('cancel_delete_button'),
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              key: const ValueKey('confirm_delete_button'),
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+    // Best-effort media stop: never let a missing plugin hang delete.
+    // Dispose() also cancels recording and releases the player.
+    try {
+      if (_isPlaying) {
+        unawaited(_player.stop().timeout(const Duration(seconds: 2)));
+      }
+    } catch (_) {}
+    if (_isRecording) {
+      try {
+        unawaited(
+          (_recorder?.cancel() ?? Future.value())
+              .timeout(const Duration(seconds: 2)),
+        );
+      } catch (_) {}
+      _isRecording = false;
+    }
+    if (!mounted) return;
+    Navigator.of(context).pop(
+      NoteEditorResult(
+        text: _controller.text,
+        audioPath: _audioPath,
+        photoPath: _photoPath,
+        deleted: true,
+      ),
+    );
   }
 
   @override
@@ -398,30 +934,160 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       canPop: false,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
-        Navigator.of(context).pop(_controller.text);
+        _popWithResult();
       },
       child: Scaffold(
+        resizeToAvoidBottomInset: true,
         appBar: AppBar(
           leading: const BackButton(),
+          actions: [
+            IconButton(
+              key: const ValueKey('delete_note_button'),
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Delete note',
+              onPressed: _confirmDelete,
+            ),
+          ],
         ),
-        body: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: TextField(
-            controller: _controller,
-            autofocus: true,
-            maxLines: null,
-            expands: true,
-            keyboardType: TextInputType.multiline,
-            textAlignVertical: TextAlignVertical.top,
-            style: const TextStyle(fontSize: 16, color: Colors.black87),
-            decoration: const InputDecoration(
-              border: InputBorder.none,
-              hintText: 'Note',
-              isDense: true,
-              contentPadding: EdgeInsets.zero,
+        body: SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              16.0,
+              16.0,
+              16.0,
+              16.0 + MediaQuery.of(context).viewInsets.bottom,
+            ),
+            child: Column(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    autofocus: true,
+                    maxLines: null,
+                    expands: true,
+                    keyboardType: TextInputType.multiline,
+                    textAlignVertical: TextAlignVertical.top,
+                    style:
+                        const TextStyle(fontSize: 16, color: Colors.black87),
+                    decoration: const InputDecoration(
+                      border: InputBorder.none,
+                      hintText: 'Note',
+                      isDense: true,
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _buildPhotoSection(),
+                const SizedBox(height: 12),
+                _buildAudioControls(),
+              ],
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildPhotoSection() {
+    final String? path = _photoPath;
+    if (path == null) {
+      return Center(
+        child: OutlinedButton.icon(
+          key: const ValueKey('attach_photo_button'),
+          icon: const Icon(Icons.add_a_photo),
+          label: Text(_isPickingPhoto ? 'Adding…' : 'Attach photo'),
+          onPressed: _isPickingPhoto ? null : _showPhotoSourceSheet,
+        ),
+      );
+    }
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ClipRRect(
+            key: const ValueKey('photo_thumbnail'),
+            borderRadius: BorderRadius.circular(8),
+            child: Image.file(
+              File(path),
+              height: 120,
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) => const Icon(
+                Icons.broken_image_outlined,
+                size: 48,
+                color: Colors.black45,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              TextButton.icon(
+                key: const ValueKey('photo_replace_button'),
+                icon: const Icon(Icons.swap_horiz),
+                label: const Text('Replace'),
+                onPressed:
+                    _isPickingPhoto ? null : _showPhotoSourceSheet,
+              ),
+              TextButton.icon(
+                key: const ValueKey('photo_remove_button'),
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('Remove'),
+                onPressed: _removePhoto,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAudioControls() {
+    if (_isRecording) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          IconButton(
+            key: const ValueKey('stop_button'),
+            icon: const Icon(Icons.stop_circle, color: Colors.red, size: 36),
+            tooltip: 'Stop recording',
+            onPressed: _toggleRecord,
+          ),
+          const SizedBox(width: 8),
+          const Text('Recording… tap to stop'),
+        ],
+      );
+    }
+    if (_audioPath != null) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          IconButton(
+            key: const ValueKey('play_button'),
+            icon: Icon(
+              _isPlaying ? Icons.pause_circle : Icons.play_circle,
+              size: 36,
+            ),
+            tooltip: _isPlaying ? 'Pause' : 'Play',
+            onPressed: _togglePlayback,
+          ),
+          const SizedBox(width: 8),
+          TextButton.icon(
+            key: const ValueKey('rerecord_button'),
+            icon: const Icon(Icons.mic),
+            label: const Text('Re-record'),
+            onPressed: _toggleRecord,
+          ),
+        ],
+      );
+    }
+    return Center(
+      child: ElevatedButton.icon(
+        key: const ValueKey('record_button'),
+        icon: const Icon(Icons.mic),
+        label: const Text('Record audio'),
+        onPressed: _toggleRecord,
       ),
     );
   }
