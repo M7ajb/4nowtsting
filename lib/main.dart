@@ -123,15 +123,22 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
       }
       final List<dynamic> decoded = jsonDecode(raw) as List<dynamic>;
       final List<BoardNote> loaded = [];
+      final Set<int> seenIds = {};
       for (final dynamic entry in decoded) {
         // Root cause: one corrupt entry aborted the whole load via outer
         // catch. Fix: skip bad entries individually.
+        // Duplicate ids would also collide ValueKeys and misdirect
+        // move/delete (indexWhere hits first). Skip dupes.
         try {
+          BoardNote? note;
           if (entry is Map<String, dynamic>) {
-            loaded.add(BoardNote.fromJson(entry));
+            note = BoardNote.fromJson(entry);
           } else if (entry is Map) {
-            loaded.add(BoardNote.fromJson(Map<String, dynamic>.from(entry)));
+            note = BoardNote.fromJson(Map<String, dynamic>.from(entry));
           }
+          if (note == null) continue;
+          if (!seenIds.add(note.id)) continue;
+          loaded.add(note);
         } catch (_) {
           continue;
         }
@@ -170,13 +177,18 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
 
   void _addNote() {
     final Size size = MediaQuery.of(context).size;
-    final double dx = (size.width - noteWidth) / 2;
-    final double dy = (size.height - noteHeight) / 2;
+    // Cascade so stacked notes stay reachable: exact overlap means only the
+    // top note ever hit-tests. Offset wraps and clamps to viewport.
+    final double step = (_notes.length * 28) % 140;
+    final double maxX = (size.width - noteWidth).clamp(0.0, double.infinity);
+    final double maxY = (size.height - noteHeight).clamp(0.0, double.infinity);
+    final double dx = ((size.width - noteWidth) / 2 + step).clamp(0.0, maxX);
+    final double dy = ((size.height - noteHeight) / 2 + step).clamp(0.0, maxY);
     setState(() {
       _notes.add(
         BoardNote(
           id: _nextNoteId++,
-          position: Offset(dx.clamp(0.0, double.infinity), dy.clamp(0.0, double.infinity)),
+          position: Offset(dx, dy),
         ),
       );
     });
@@ -206,6 +218,11 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
       final double ny = (note.position.dy + delta.dy).clamp(0.0, maxY);
       note.position = Offset(nx, ny);
     });
+    // No save here: onPanUpdate fires per-pixel and would spam
+    // SharedPreferences. Persist once on drag end.
+  }
+
+  void _finishDrag() {
     unawaited(_saveNotes());
   }
 
@@ -306,6 +323,7 @@ class _ConnectionsBoardScreenState extends State<ConnectionsBoardScreen> {
                 note: note,
                 onDragStart: () => _bringToFront(note.id),
                 onDragUpdate: (delta) => _moveNote(note.id, delta, viewport),
+                onDragEnd: () => _finishDrag(),
                 onLongPress: () => _openNoteEditor(note),
                 onTap: () => _bringToFront(note.id),
               ),
@@ -441,6 +459,7 @@ class _NoteCard extends StatelessWidget {
   final BoardNote note;
   final VoidCallback onDragStart;
   final ValueChanged<Offset> onDragUpdate;
+  final VoidCallback onDragEnd;
   final VoidCallback onLongPress;
   final VoidCallback onTap;
 
@@ -449,6 +468,7 @@ class _NoteCard extends StatelessWidget {
     required this.note,
     required this.onDragStart,
     required this.onDragUpdate,
+    required this.onDragEnd,
     required this.onLongPress,
     required this.onTap,
   });
@@ -471,33 +491,43 @@ class _NoteCard extends StatelessWidget {
       previewColor = Colors.black45;
     }
     final bool hasPhoto = note.photoPath != null;
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onPanStart: (_) => onDragStart(),
-      onPanUpdate: (details) => onDragUpdate(details.delta),
-      child: Container(
-        width: _ConnectionsBoardScreenState.noteWidth,
-        height: _ConnectionsBoardScreenState.noteHeight,
-        decoration: BoxDecoration(
-          color: note.color,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.black.withOpacity(0.15)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.25),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Column(
-          children: [
-            // Drag handle: guaranteed pan area so dragging works.
-            // Whole card remains wrapped in the outer pan
-            // GestureDetector, so edge drags work too.
-            // Long-press is isolated to the preview body so handle
-            // drags never compete with the long-press recognizer.
-            Container(
+    // Root cause of the audio/photo regression: the preview body used a
+    // nested inner GestureDetector (tap/long-press) inside an outer pan
+    // detector. Ancestor + descendant recognizers compete in the arena, so
+    // on a real device the outer pan wins with any finger jitter during the
+    // long-press timeout and the editor becomes unreachable. Since the card
+    // is a read-only preview (inline TextField was removed for the editor),
+    // losing the editor also meant tapping could never lead to typing.
+    // Fix: no outer wrapper. Handle is pan-only (precise drag, no tap
+    // competition eating ~20px slop); preview body owns pan + tap +
+    // long-press in one detector so they share a single arena.
+    return Container(
+      width: _ConnectionsBoardScreenState.noteWidth,
+      height: _ConnectionsBoardScreenState.noteHeight,
+      decoration: BoxDecoration(
+        color: note.color,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.black.withOpacity(0.15)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.25),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          // Drag handle: pan-only for pixel-exact drags (adding tap here
+          // eats ~20px slop and regressed the drag test). Tap-to-front
+          // lives on the preview body below, the larger target; dragging
+          // via the handle already brings to front through onPanStart.
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onPanStart: (_) => onDragStart(),
+            onPanUpdate: (details) => onDragUpdate(details.delta),
+            onPanEnd: (_) => onDragEnd(),
+            child: Container(
               key: ValueKey('note_handle_${note.id}'),
               height: 24,
               alignment: Alignment.center,
@@ -508,10 +538,6 @@ class _NoteCard extends StatelessWidget {
                   topRight: Radius.circular(12),
                 ),
               ),
-              // Handle is drag-only by design: adding a tap recognizer here
-              // competes in the gesture arena and eats ~20px of drag slop
-              // (regressed the drag test). Tap-to-front lives on the preview
-              // body below, which is the larger target.
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -529,46 +555,48 @@ class _NoteCard extends StatelessWidget {
                 ],
               ),
             ),
-            Expanded(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: onTap,
-                onLongPress: onLongPress,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child: Align(
-                          alignment: Alignment.topLeft,
-                          child: Text(
-                            previewText,
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: previewColor,
-                            ),
+          ),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanStart: (_) => onDragStart(),
+              onPanUpdate: (details) => onDragUpdate(details.delta),
+              onPanEnd: (_) => onDragEnd(),
+              onTap: onTap,
+              onLongPress: onLongPress,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Align(
+                        alignment: Alignment.topLeft,
+                        child: Text(
+                          previewText,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: previewColor,
                           ),
                         ),
                       ),
-                      if (hasPhoto) ...[
-                        const SizedBox(width: 4),
-                        _PhotoThumb(
-                          path: note.photoPath!,
-                          size: 36,
-                          key: ValueKey(
-                              'photo_thumb_card_${note.id}'),
-                        ),
-                      ],
+                    ),
+                    if (hasPhoto) ...[
+                      const SizedBox(width: 4),
+                      _PhotoThumb(
+                        path: note.photoPath!,
+                        size: 36,
+                        key: ValueKey('photo_thumb_card_${note.id}'),
+                      ),
                     ],
-                  ),
+                  ],
                 ),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -587,12 +615,15 @@ class _PhotoThumb extends StatelessWidget {
       return Icon(Icons.photo_outlined,
           size: size * 0.6, color: Colors.black45);
     }
+    final int px = (size * 2).round();
     return ClipRRect(
       borderRadius: BorderRadius.circular(6),
       child: Image.file(
         file,
         width: size,
         height: size,
+        cacheWidth: px,
+        cacheHeight: px,
         fit: BoxFit.cover,
         errorBuilder: (context, error, stackTrace) => const Icon(
           Icons.photo_outlined,
@@ -648,6 +679,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   String? _audioPath;
   String? _photoPath;
+  String? _tmpPath;
   bool _isRecording = false;
   bool _isPlaying = false;
   bool _isPickingPhoto = false;
@@ -675,8 +707,18 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
   @override
   void dispose() {
     _completeSub?.cancel();
+    // Best-effort discard of an in-progress recording so popping mid-record
+    // neither leaks note_X_tmp.m4a nor races dispose() against cancel().
+    final String? tmp = _tmpPath;
     if (_isRecording) {
-      _recorder?.cancel();
+      try {
+        _recorder?.cancel();
+      } catch (_) {}
+      if (tmp != null && tmp.isNotEmpty) {
+        try {
+          File(tmp).delete().ignore();
+        } catch (_) {}
+      }
     }
     _recorder?.dispose();
     _player.dispose();
@@ -717,6 +759,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     try {
       final Directory docs = await getApplicationDocumentsDirectory();
       final String tmpPath = '${docs.path}/note_${widget.noteId}_tmp.m4a';
+      _tmpPath = tmpPath;
       _recorder ??= AudioRecorder();
       await _recorder!.start(const RecordConfig(), path: tmpPath);
       if (mounted) setState(() => _isRecording = true);
@@ -733,7 +776,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       final String? stoppedPath = await _recorder?.stop();
       final Directory docs = await getApplicationDocumentsDirectory();
       final String finalPath = '${docs.path}/note_${widget.noteId}.m4a';
-      String resolved = finalPath;
+      String? resolved = finalPath;
       if (stoppedPath != null && stoppedPath != finalPath) {
         // Promote tmp recording so abort (cancel) never deletes old clip.
         final File tmpFile = File(stoppedPath);
@@ -745,11 +788,20 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         } else {
           resolved = stoppedPath;
         }
+      } else if (stoppedPath == null) {
+        // Recorder produced nothing: keep previous clip, don't invent one.
+        resolved = null;
       }
+      // Guard against phantom paths: only publish if the file is really there.
+      if (resolved != null && !await File(resolved).exists()) {
+        resolved = null;
+      }
+      _tmpPath = null;
       if (mounted) {
         setState(() {
           _isRecording = false;
-          _audioPath = resolved;
+          // Keep old clip when stop yields nothing usable.
+          if (resolved != null) _audioPath = resolved;
         });
       }
     } catch (_) {
@@ -909,12 +961,12 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
     } catch (_) {}
     if (_isRecording) {
+      // Await (bounded) so dispose() below can't race an in-flight cancel.
       try {
-        unawaited(
-          (_recorder?.cancel() ?? Future.value())
-              .timeout(const Duration(seconds: 2)),
-        );
+        await (_recorder?.cancel() ?? Future.value())
+            .timeout(const Duration(seconds: 2));
       } catch (_) {}
+      _tmpPath = null;
       _isRecording = false;
     }
     if (!mounted) return;
@@ -961,6 +1013,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
               children: [
                 Expanded(
                   child: TextField(
+                    key: const ValueKey('editor_text_field'),
                     controller: _controller,
                     autofocus: true,
                     maxLines: null,
@@ -978,9 +1031,21 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                _buildPhotoSection(),
-                const SizedBox(height: 12),
-                _buildAudioControls(),
+                // Attachments scroll instead of overflowing when the keyboard
+                // + 120px photo + controls exceed a short viewport.
+                Flexible(
+                  flex: 0,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildPhotoSection(),
+                        const SizedBox(height: 12),
+                        _buildAudioControls(),
+                      ],
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -1011,6 +1076,7 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
             child: Image.file(
               File(path),
               height: 120,
+              cacheHeight: 240,
               fit: BoxFit.cover,
               errorBuilder: (context, error, stackTrace) => const Icon(
                 Icons.broken_image_outlined,
